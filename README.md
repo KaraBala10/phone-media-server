@@ -1,4 +1,4 @@
-# 📱 HotSpot Media Server
+# 📱 Phone Media Server
 
 ![Flutter](https://img.shields.io/badge/Flutter-3.0+-blue.svg)
 ![Platform](https://img.shields.io/badge/Platform-Android-green.svg)
