@@ -183,7 +183,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📧 Contact
 
-Project Link: [https://github.com/YOUR_USERNAME/hotspot-media-server](https://github.com/YOUR_USERNAME/hotspot-media-server)
+Project Link: [https://github.com/KaraBala10/hotspot-media-server](https://github.com/YOUR_USERNAME/hotspot-media-server)
 
 ---
 
