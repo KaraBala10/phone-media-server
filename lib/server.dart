@@ -1000,9 +1000,9 @@ class Server {
         );
       }
 
-      // For images, serve an HTML page with fullscreen image viewer
+      // For images, serve as video (single frame) to use fullscreen feature
       final imageUrl = '/' + route.route + '?file=1';
-      final html = _createImagePage(imageUrl, route.mediaName);
+      final html = _createImageAsVideoPage(imageUrl, route.mediaName);
       return Response.ok(
         html,
         headers: {
@@ -1174,7 +1174,7 @@ class Server {
 ''';
   }
 
-  static String _createImagePage(String imageUrl, String imageName) {
+  static String _createImageAsVideoPage(String imageUrl, String imageName) {
     return '''
 <!DOCTYPE html>
 <html>
@@ -1207,17 +1207,16 @@ class Server {
             justify-content: center;
         }
         
-        img {
-            max-width: 100vw;
-            max-height: 100vh;
-            width: auto;
-            height: auto;
+        video {
+            width: 100vw;
+            height: 100vh;
             object-fit: contain;
             outline: none;
-            user-select: none;
-            -webkit-user-select: none;
-            -moz-user-select: none;
-            -ms-user-select: none;
+            background: #000;
+        }
+        
+        canvas {
+            display: none;
         }
         
         .loading {
@@ -1231,20 +1230,60 @@ class Server {
 </head>
 <body>
     <div class="loading" id="loading">Loading image...</div>
-    <img 
-        id="imageViewer"
-        src="${imageUrl}"
-        alt="${imageName}"
-        onload="enterFullscreen()"
+    <canvas id="imageCanvas"></canvas>
+    <video 
+        id="videoPlayer"
+        autoplay 
+        loop 
+        playsinline
+        muted
+        controls
+        preload="auto"
+        onloadeddata="enterFullscreen()"
         onerror="handleError()">
+    </video>
     
     <script>
-        const img = document.getElementById('imageViewer');
+        const video = document.getElementById('videoPlayer');
+        const canvas = document.getElementById('imageCanvas');
         const loading = document.getElementById('loading');
+        const ctx = canvas.getContext('2d');
+        const img = new Image();
+        
+        img.crossOrigin = 'anonymous';
+        img.onload = function() {
+            // Set canvas size to match image
+            canvas.width = img.width;
+            canvas.height = img.height;
+            
+            // Draw image on canvas
+            ctx.drawImage(img, 0, 0);
+            
+            // Convert canvas to video stream (30 FPS for smooth playback)
+            const stream = canvas.captureStream(30);
+            
+            // Set video source to the stream
+            video.srcObject = stream;
+            
+            // Play the video
+            video.play().then(function() {
+                loading.style.display = 'none';
+                enterFullscreen();
+            }).catch(function(err) {
+                console.log('Video play failed:', err);
+                loading.style.display = 'none';
+                enterFullscreen();
+            });
+        };
+        
+        img.onerror = function() {
+            handleError();
+        };
+        
+        // Load the image
+        img.src = '${imageUrl}';
         
         function enterFullscreen() {
-            loading.style.display = 'none';
-            
             // Enter fullscreen automatically
             setTimeout(function() {
                 if (document.documentElement.requestFullscreen) {
@@ -1264,6 +1303,7 @@ class Server {
         function handleError() {
             loading.textContent = 'Error loading image';
             loading.style.color = '#f44336';
+            loading.style.display = 'block';
         }
         
         // Handle fullscreen changes - re-enter if exited
@@ -1297,6 +1337,19 @@ class Server {
             }
         });
         
+        // Ensure video restarts when it ends (loop should handle this, but as backup)
+        video.addEventListener('ended', function() {
+            video.currentTime = 0;
+            video.play();
+        });
+        
+        // Handle visibility change - restart video when page becomes visible
+        document.addEventListener('visibilitychange', function() {
+            if (!document.hidden && video.paused) {
+                video.play();
+            }
+        });
+        
         // Prevent context menu
         document.addEventListener('contextmenu', function(e) {
             e.preventDefault();
@@ -1304,11 +1357,6 @@ class Server {
         
         // Prevent text selection
         document.addEventListener('selectstart', function(e) {
-            e.preventDefault();
-        });
-        
-        // Prevent drag
-        document.addEventListener('dragstart', function(e) {
             e.preventDefault();
         });
     </script>
