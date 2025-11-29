@@ -158,9 +158,40 @@ class Server {
       return await _handleUpload(request);
     }
 
-    // Check custom routes first
-    final customRoute = _routeManager!.getRoute(path);
+    // Check custom routes first (path is already cleaned by request.url.path)
+    // Remove leading slash if present for route lookup
+    final routePath = path.startsWith('/') ? path.substring(1) : path;
+    final customRoute = _routeManager!.getRoute(routePath);
     if (customRoute != null) {
+      // Check if this is a direct file request (from <video> or <img> tag)
+      // Query parameter ?file=1 indicates direct file request
+      final isFileRequest = request.url.queryParameters['file'] == '1';
+      
+      // Also check Accept header as fallback
+      final acceptHeader = request.headers['accept'] ?? '';
+      final isVideoRequest = acceptHeader.contains('video/') && 
+                            !acceptHeader.contains('text/html');
+      final isImageRequest = acceptHeader.contains('image/') && 
+                            !acceptHeader.contains('text/html');
+      
+      // If it's a direct file request, serve the file directly
+      if (isFileRequest) {
+        if (customRoute.isVideo) {
+          return await _serveVideoFile(customRoute);
+        } else {
+          return await _serveImageFile(customRoute);
+        }
+      }
+      
+      // Also check Accept header for direct file requests
+      if (customRoute.isVideo && isVideoRequest) {
+        return await _serveVideoFile(customRoute);
+      }
+      if (customRoute.isImage && isImageRequest) {
+        return await _serveImageFile(customRoute);
+      }
+      
+      // Otherwise serve the HTML page (for both videos and images)
       return await _serveCustomRoute(customRoute);
     }
 
@@ -509,17 +540,46 @@ class Server {
             const container = document.getElementById('routes-container');
             const statsBar = document.getElementById('stats-bar');
             
+            // Show loading state
             container.className = 'loading';
             container.innerHTML = '<div class="loading-spinner"></div><div class="loading-text">Loading routes...</div>';
             
             try {
-                const response = await fetch('/api/routes?t=' + Date.now());
-                if (!response.ok) {
-                    throw new Error('Failed to load routes');
-                }
-                const routes = await response.json();
+                // Add timeout to fetch
+                const controller = new AbortController();
+                const timeoutId = setTimeout(function() {
+                    controller.abort();
+                }, 10000); // 10 second timeout
                 
-                if (!routes || routes.length === 0) {
+                const response = await fetch('/api/routes?t=' + Date.now(), {
+                    method: 'GET',
+                    headers: {
+                        'Accept': 'application/json',
+                    },
+                    cache: 'no-cache',
+                    signal: controller.signal
+                });
+                
+                clearTimeout(timeoutId);
+                
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    throw new Error('HTTP ' + response.status + ': ' + errorText);
+                }
+                
+                const text = await response.text();
+                let routes;
+                try {
+                    routes = JSON.parse(text);
+                } catch (e) {
+                    throw new Error('Invalid JSON response: ' + text.substring(0, 100));
+                }
+                
+                // Hide loading immediately
+                container.className = '';
+                container.innerHTML = '';
+                
+                if (!routes || !Array.isArray(routes) || routes.length === 0) {
                     statsBar.style.display = 'none';
                     container.className = 'empty-state';
                     container.innerHTML = 
@@ -530,8 +590,8 @@ class Server {
                 }
                 
                 // Calculate stats
-                const imageCount = routes.filter(route => route.isImage).length;
-                const videoCount = routes.filter(route => route.isVideo).length;
+                const imageCount = routes.filter(function(route) { return route.isImage === true; }).length;
+                const videoCount = routes.filter(function(route) { return route.isVideo === true; }).length;
                 
                 document.getElementById('image-count').textContent = imageCount;
                 document.getElementById('video-count').textContent = videoCount;
@@ -540,37 +600,55 @@ class Server {
                 
                 container.className = 'media-grid';
                 container.innerHTML = routes.map(function(route) {
-                    const isImage = route.isImage;
+                    const isImage = route.isImage === true;
                     const typeClass = isImage ? 'image' : 'video';
                     const icon = isImage ? '📷' : '🎬';
-                    const routePath = '/' + route.route;
+                    const routePath = '/' + (route.route || '');
+                    const mediaName = route.mediaName || 'Unknown';
                     
-                    return '<div class="media-item" onclick="window.open(\'' + routePath + '\', \'_blank\')">' +
+                    return '<div class="media-item" data-route="' + routePath.replace(/"/g, '&quot;') + '">' +
                         '<div class="media-preview" style="display: flex; align-items: center; justify-content: center; background: linear-gradient(135deg, ' + 
                         (isImage ? '#2196F3, #1976D2' : '#9C27B0, #7B1FA2') + ');">' +
                             '<div style="font-size: 80px;">' + icon + '</div>' +
                             '<div class="media-type-badge ' + typeClass + '">' + (isImage ? 'image' : 'video') + '</div>' +
                         '</div>' +
                         '<div class="media-info">' +
-                            '<div class="media-name">' + routePath + '</div>' +
+                            '<div class="media-name">' + routePath.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</div>' +
                             '<div class="media-meta">' +
                                 '<span>' + icon + '</span>' +
-                                '<span>' + route.mediaName + '</span>' +
+                                '<span>' + mediaName.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</span>' +
                             '</div>' +
                         '</div>' +
                     '</div>';
                 }).join('');
+                
+                // Add click event listeners to all media items
+                container.querySelectorAll('.media-item').forEach(function(item) {
+                    item.addEventListener('click', function() {
+                        const route = item.getAttribute('data-route');
+                        if (route) {
+                            window.open(route, '_blank');
+                        }
+                    });
+                });
             } catch (error) {
+                console.error('Error loading routes:', error);
                 statsBar.style.display = 'none';
                 container.className = 'error-state';
+                const errorMsg = error.name === 'AbortError' ? 'Request timeout. Please try again.' : (error.message || 'Unknown error');
                 container.innerHTML = 
                     '<div class="error-icon">⚠️</div>' +
                     '<div class="error-title">Unable to Load Routes</div>' +
-                    '<div class="error-text">Please check your connection and try again<br>' + error.message + '</div>';
+                    '<div class="error-text">' + errorMsg + '<br><button onclick="loadRoutes()" style="margin-top: 20px; padding: 10px 20px; background: #6C63FF; color: white; border: none; border-radius: 8px; cursor: pointer;">Retry</button></div>';
             }
         }
         
-        loadRoutes();
+        // Load routes when page is ready
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', loadRoutes);
+        } else {
+            loadRoutes();
+        }
     </script>
 </body>
 </html>
@@ -824,7 +902,7 @@ class Server {
     }
   }
 
-  static Future<Response> _serveCustomRoute(MediaRoute route) async {
+  static Future<Response> _serveVideoFile(MediaRoute route) async {
     try {
       final file = File(route.mediaPath);
       if (!await file.exists()) {
@@ -833,29 +911,58 @@ class Server {
 
       final fileContent = await file.readAsBytes();
       
-      // Determine content type
+      // Determine video content type
       String contentType;
-      if (route.isVideo) {
-        if (route.mediaPath.toLowerCase().endsWith('.mp4') || 
-            route.mediaPath.toLowerCase().endsWith('.m4v')) {
-          contentType = 'video/mp4';
-        } else if (route.mediaPath.toLowerCase().endsWith('.mov')) {
-          contentType = 'video/quicktime';
-        } else if (route.mediaPath.toLowerCase().endsWith('.webm')) {
-          contentType = 'video/webm';
-        } else {
-          contentType = 'video/mp4';
-        }
+      if (route.mediaPath.toLowerCase().endsWith('.mp4') || 
+          route.mediaPath.toLowerCase().endsWith('.m4v')) {
+        contentType = 'video/mp4';
+      } else if (route.mediaPath.toLowerCase().endsWith('.mov')) {
+        contentType = 'video/quicktime';
+      } else if (route.mediaPath.toLowerCase().endsWith('.webm')) {
+        contentType = 'video/webm';
+      } else if (route.mediaPath.toLowerCase().endsWith('.mkv')) {
+        contentType = 'video/x-matroska';
       } else {
-        if (route.mediaPath.toLowerCase().endsWith('.png')) {
-          contentType = 'image/png';
-        } else if (route.mediaPath.toLowerCase().endsWith('.gif')) {
-          contentType = 'image/gif';
-        } else if (route.mediaPath.toLowerCase().endsWith('.webp')) {
-          contentType = 'image/webp';
-        } else {
-          contentType = 'image/jpeg';
-        }
+        contentType = 'video/mp4';
+      }
+
+      return Response.ok(
+        fileContent,
+        headers: {
+          'Content-Type': contentType,
+          'Content-Length': fileContent.length.toString(),
+          'Cache-Control': 'public, max-age=3600',
+          'Accept-Ranges': 'bytes',
+        },
+      );
+    } catch (e) {
+      return Response.internalServerError(body: 'Error serving video: $e');
+    }
+  }
+
+  static Future<Response> _serveImageFile(MediaRoute route) async {
+    try {
+      final file = File(route.mediaPath);
+      if (!await file.exists()) {
+        return Response.notFound('File not found');
+      }
+
+      final fileContent = await file.readAsBytes();
+      
+      // Determine image content type
+      String contentType;
+      if (route.mediaPath.toLowerCase().endsWith('.png')) {
+        contentType = 'image/png';
+      } else if (route.mediaPath.toLowerCase().endsWith('.gif')) {
+        contentType = 'image/gif';
+      } else if (route.mediaPath.toLowerCase().endsWith('.webp')) {
+        contentType = 'image/webp';
+      } else if (route.mediaPath.toLowerCase().endsWith('.bmp')) {
+        contentType = 'image/bmp';
+      } else if (route.mediaPath.toLowerCase().endsWith('.svg')) {
+        contentType = 'image/svg+xml';
+      } else {
+        contentType = 'image/jpeg';
       }
 
       return Response.ok(
@@ -867,8 +974,347 @@ class Server {
         },
       );
     } catch (e) {
+      return Response.internalServerError(body: 'Error serving image: $e');
+    }
+  }
+
+  static Future<Response> _serveCustomRoute(MediaRoute route) async {
+    try {
+      final file = File(route.mediaPath);
+      if (!await file.exists()) {
+        return Response.notFound('File not found');
+      }
+
+      // For videos, serve an HTML page with fullscreen autoplay video
+      if (route.isVideo) {
+        final videoUrl = '/' + route.route + '?file=1';
+        final html = _createVideoPage(videoUrl, route.mediaName);
+        return Response.ok(
+          html,
+          headers: {
+            'Content-Type': 'text/html; charset=utf-8',
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
+            'Expires': '0',
+          },
+        );
+      }
+
+      // For images, serve an HTML page with fullscreen image viewer
+      final imageUrl = '/' + route.route + '?file=1';
+      final html = _createImagePage(imageUrl, route.mediaName);
+      return Response.ok(
+        html,
+        headers: {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
+          'Pragma': 'no-cache',
+          'Expires': '0',
+        },
+      );
+    } catch (e) {
       return Response.internalServerError(body: 'Error serving route: $e');
     }
+  }
+
+  static String _createVideoPage(String videoUrl, String videoName) {
+    return '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>${videoName}</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #000;
+            position: fixed;
+            top: 0;
+            left: 0;
+        }
+        
+        body {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        video {
+            width: 100vw;
+            height: 100vh;
+            object-fit: contain;
+            outline: none;
+            background: #000;
+        }
+        
+        .loading {
+            position: absolute;
+            color: white;
+            font-size: 18px;
+            opacity: 0.7;
+            z-index: 1;
+        }
+    </style>
+</head>
+<body>
+    <div class="loading" id="loading" style="display: none;"></div>
+    <video 
+        id="videoPlayer"
+        autoplay 
+        loop 
+        playsinline
+        controls
+        preload="auto"
+        onloadeddata="enterFullscreen()"
+        onerror="handleError()">
+        <source src="${videoUrl}" type="video/mp4">
+    </video>
+    
+    <script>
+        const video = document.getElementById('videoPlayer');
+        const loading = document.getElementById('loading');
+        
+        function enterFullscreen() {
+            loading.style.display = 'none';
+            
+            // Enter fullscreen automatically
+            setTimeout(function() {
+                if (document.documentElement.requestFullscreen) {
+                    document.documentElement.requestFullscreen().catch(function(err) {
+                        console.log('Fullscreen request failed:', err);
+                    });
+                } else if (document.documentElement.webkitRequestFullscreen) {
+                    document.documentElement.webkitRequestFullscreen();
+                } else if (document.documentElement.mozRequestFullScreen) {
+                    document.documentElement.mozRequestFullScreen();
+                } else if (document.documentElement.msRequestFullscreen) {
+                    document.documentElement.msRequestFullscreen();
+                }
+            }, 100);
+            
+            // Ensure video plays
+            video.play().catch(function(err) {
+                console.log('Autoplay failed:', err);
+            });
+        }
+        
+        function handleError() {
+            loading.textContent = 'Error loading video';
+            loading.style.color = '#f44336';
+            loading.style.display = 'block';
+        }
+        
+        // Handle fullscreen changes - re-enter if exited
+        document.addEventListener('fullscreenchange', function() {
+            if (!document.fullscreenElement) {
+                setTimeout(function() {
+                    if (document.documentElement.requestFullscreen) {
+                        document.documentElement.requestFullscreen().catch(function() {});
+                    }
+                }, 300);
+            }
+        });
+        
+        document.addEventListener('webkitfullscreenchange', function() {
+            if (!document.webkitFullscreenElement) {
+                setTimeout(function() {
+                    if (document.documentElement.webkitRequestFullscreen) {
+                        document.documentElement.webkitRequestFullscreen();
+                    }
+                }, 300);
+            }
+        });
+        
+        document.addEventListener('mozfullscreenchange', function() {
+            if (!document.mozFullScreenElement) {
+                setTimeout(function() {
+                    if (document.documentElement.mozRequestFullScreen) {
+                        document.documentElement.mozRequestFullScreen();
+                    }
+                }, 300);
+            }
+        });
+        
+        // Ensure video restarts when it ends
+        video.addEventListener('ended', function() {
+            video.currentTime = 0;
+            video.play();
+        });
+        
+        // Handle visibility change - restart video when page becomes visible
+        document.addEventListener('visibilitychange', function() {
+            if (!document.hidden && video.paused) {
+                video.play();
+            }
+        });
+        
+        // Prevent context menu
+        document.addEventListener('contextmenu', function(e) {
+            e.preventDefault();
+        });
+        
+        // Prevent text selection
+        document.addEventListener('selectstart', function(e) {
+            e.preventDefault();
+        });
+    </script>
+</body>
+</html>
+''';
+  }
+
+  static String _createImagePage(String imageUrl, String imageName) {
+    return '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>${imageName}</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #000;
+            position: fixed;
+            top: 0;
+            left: 0;
+        }
+        
+        body {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        img {
+            max-width: 100vw;
+            max-height: 100vh;
+            width: auto;
+            height: auto;
+            object-fit: contain;
+            outline: none;
+            user-select: none;
+            -webkit-user-select: none;
+            -moz-user-select: none;
+            -ms-user-select: none;
+        }
+        
+        .loading {
+            position: absolute;
+            color: white;
+            font-size: 18px;
+            opacity: 0.7;
+            z-index: 1;
+        }
+    </style>
+</head>
+<body>
+    <div class="loading" id="loading">Loading image...</div>
+    <img 
+        id="imageViewer"
+        src="${imageUrl}"
+        alt="${imageName}"
+        onload="enterFullscreen()"
+        onerror="handleError()">
+    
+    <script>
+        const img = document.getElementById('imageViewer');
+        const loading = document.getElementById('loading');
+        
+        function enterFullscreen() {
+            loading.style.display = 'none';
+            
+            // Enter fullscreen automatically
+            setTimeout(function() {
+                if (document.documentElement.requestFullscreen) {
+                    document.documentElement.requestFullscreen().catch(function(err) {
+                        console.log('Fullscreen request failed:', err);
+                    });
+                } else if (document.documentElement.webkitRequestFullscreen) {
+                    document.documentElement.webkitRequestFullscreen();
+                } else if (document.documentElement.mozRequestFullScreen) {
+                    document.documentElement.mozRequestFullScreen();
+                } else if (document.documentElement.msRequestFullscreen) {
+                    document.documentElement.msRequestFullscreen();
+                }
+            }, 100);
+        }
+        
+        function handleError() {
+            loading.textContent = 'Error loading image';
+            loading.style.color = '#f44336';
+        }
+        
+        // Handle fullscreen changes - re-enter if exited
+        document.addEventListener('fullscreenchange', function() {
+            if (!document.fullscreenElement) {
+                setTimeout(function() {
+                    if (document.documentElement.requestFullscreen) {
+                        document.documentElement.requestFullscreen().catch(function() {});
+                    }
+                }, 300);
+            }
+        });
+        
+        document.addEventListener('webkitfullscreenchange', function() {
+            if (!document.webkitFullscreenElement) {
+                setTimeout(function() {
+                    if (document.documentElement.webkitRequestFullscreen) {
+                        document.documentElement.webkitRequestFullscreen();
+                    }
+                }, 300);
+            }
+        });
+        
+        document.addEventListener('mozfullscreenchange', function() {
+            if (!document.mozFullScreenElement) {
+                setTimeout(function() {
+                    if (document.documentElement.mozRequestFullScreen) {
+                        document.documentElement.mozRequestFullScreen();
+                    }
+                }, 300);
+            }
+        });
+        
+        // Prevent context menu
+        document.addEventListener('contextmenu', function(e) {
+            e.preventDefault();
+        });
+        
+        // Prevent text selection
+        document.addEventListener('selectstart', function(e) {
+            e.preventDefault();
+        });
+        
+        // Prevent drag
+        document.addEventListener('dragstart', function(e) {
+            e.preventDefault();
+        });
+    </script>
+</body>
+</html>
+''';
   }
 
   static int _findBytes(List<int> haystack, List<int> needle, int start) {
